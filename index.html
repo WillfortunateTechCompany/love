@@ -10575,6 +10575,12 @@
                             mediaVideo.src = srcToUse;
                             mediaVideo.load();
                             mediaVideo.style.display = "block";
+                            // If the user left the William dashboard, do NOT
+                            // let the newly-loaded source start playing on its own.
+                            if (__williamVideoSuspended) {
+                                mediaVideo.autoplay = false;
+                                try { mediaVideo.pause(); } catch (e) { }
+                            }
                         }
                     }
                     if (videoPlaceholder) videoPlaceholder.style.display = "none";
@@ -10584,6 +10590,10 @@
                         mediaVideo.src = globalWilliamVideo;
                         mediaVideo.load();
                         mediaVideo.style.display = "block";
+                        if (__williamVideoSuspended) {
+                            mediaVideo.autoplay = false;
+                            try { mediaVideo.pause(); } catch (e) { }
+                        }
                     }
                     if (videoPlaceholder) videoPlaceholder.style.display = "none";
                 } else {
@@ -10605,6 +10615,33 @@
                     const mediaVideo = document.getElementById("mediaVideo");
                     if (mediaVideo) { mediaVideo.src = globalWilliamVideo; mediaVideo.load(); }
                 }
+            }
+        }
+
+        // ------------------------------------------------------------
+        // WILLIAM VIDEO SUSPEND FLAG
+        // Set true whenever the user leaves the William dashboard.
+        // loadUserMedia() checks it and refuses to autoplay the video
+        // when the dashboard is not the active view.
+        // ------------------------------------------------------------
+        let __williamVideoSuspended = false;
+
+        function __suspendWilliamVideo() {
+            __williamVideoSuspended = true;
+            const mediaVideo = document.getElementById("mediaVideo");
+            if (mediaVideo) {
+                try {
+                    mediaVideo.pause();
+                    mediaVideo.autoplay = false;
+                } catch (e) { }
+            }
+        }
+
+        function __resumeWilliamVideo() {
+            __williamVideoSuspended = false;
+            const mediaVideo = document.getElementById("mediaVideo");
+            if (mediaVideo) {
+                try { mediaVideo.autoplay = false; } catch (e) { }
             }
         }
 
@@ -12016,7 +12053,10 @@
             mediaVideo.preload = "auto";
             mediaVideo.setAttribute('playsinline', '');
             mediaVideo.setAttribute('webkit-playsinline', '');
-            mediaVideo.autoplay = true;
+            // Do NOT force autoplay here. Autoplay is decided per-navigation
+            // via __williamVideoSuspended, so a video left playing when the
+            // user navigates away stays paused until they return.
+            mediaVideo.autoplay = false;
 
             mediaVideo.pause();
             if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-play"></i>';
@@ -13424,6 +13464,8 @@
                 document.getElementById("mainDashboard").style.display = "none";
                 document.getElementById("williamDashboard").style.display = "flex";
                 setMobileMenuVisibility();
+                // Entering William → allow the video to play/resume normally
+                __resumeWilliamVideo();
                 // Always re-pull the user's saved image/video from local
                 // storage when the William dashboard opens. This guarantees
                 // the image is shown even after a hard refresh, a tab
@@ -13437,8 +13479,9 @@
             });
 
             document.getElementById("backToLoginBtnMain")?.addEventListener("click", function () {
+                // Leaving William → hard-suspend the video so it stays paused
+                __suspendWilliamVideo();
                 saveVideoPosition();
-                document.getElementById("mediaVideo")?.pause();
                 document.getElementById("loginDashboard").style.display = "flex";
                 document.getElementById("mainDashboard").style.display = "none";
                 document.getElementById("williamDashboard").style.display = "none";
@@ -13455,8 +13498,8 @@
         // ------------------------------------------------------------
         function initWilliamDashboard() {
             document.getElementById("nextArrowBtnWilliam")?.addEventListener("click", function () {
+                __suspendWilliamVideo();
                 saveVideoPosition();
-                document.getElementById("mediaVideo")?.pause();
                 document.getElementById("williamDashboard").style.display = "none";
                 document.getElementById("mainDashboard").style.display = "flex";
                 setMobileMenuVisibility();
