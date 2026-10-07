@@ -7156,7 +7156,7 @@
         function initUserStorageDB(email) {
             return new Promise((resolve, reject) => {
                 const dbName = getUserDatabaseName(email);
-                const request = indexedDB.open(dbName, USER_STORAGE_VERSION);
+                const request = indexedDB.open(dbName, USER_STORAGE_VERSION + 1);
                 request.onerror = () => reject(request.error);
                 request.onsuccess = () => resolve(request.result);
                 request.onupgradeneeded = (event) => {
@@ -7240,54 +7240,87 @@
         }
 
         async function saveUserVideo(email, videoId, videoBlob) {
-            // Always stash in the session mirror first — zero-cost, and it
-            // rescues the video if IndexedDB is slow or fails.
+            // 1) In-memory mirror — instant, same session only.
             try {
                 __userVideoMemoryMirror.set(email + '::' + videoId, videoBlob);
             } catch (e) { }
 
-            // Also mirror small videos (< 3 MB) into localStorage as a base64
-            // data URL. This is the last line of defence: if iOS Safari wipes
-            // IndexedDB (private mode, "clear website data", storage pressure),
-            // localStorage usually survives and we can restore the video.
-            const MAX_LS_VIDEO_BYTES = 3 * 1024 * 1024;
+            // 2) Convert to a base64 DATA URL once. This string is what we
+            //    save. Strings in IndexedDB are never dropped by iOS Safari
+            //    or Android WebView the way Blobs are.
+            let dataUrl = null;
             try {
-                if (videoBlob && videoBlob.size && videoBlob.size <= MAX_LS_VIDEO_BYTES) {
-                    const fr = new FileReader();
-                    fr.onload = () => {
-                        try {
-                            localStorage.setItem('wf_user_video_mirror_' + email, JSON.stringify({
-                                id: videoId,
-                                data: fr.result,
-                                savedAt: Date.now()
-                            }));
-                        } catch (e) { }
-                    };
+                const fr = new FileReader();
+                dataUrl = await new Promise((resolve, reject) => {
+                    fr.onload = () => resolve(fr.result);
+                    fr.onerror = () => reject(fr.error);
                     fr.readAsDataURL(videoBlob);
-                }
-            } catch (e) { }
+                });
+            } catch (e) { dataUrl = null; }
+            if (!dataUrl || typeof dataUrl !== 'string' || dataUrl.length < 32) {
+                return false;
+            }
 
-            // Await the actual IndexedDB transaction so we know it committed.
-            // The old version returned true as soon as put() was called, even
-            // if the transaction later aborted (quota, private mode, WebView
-            // restriction). That is why the video vanished on refresh.
+            const mime = (videoBlob && videoBlob.type) ? videoBlob.type : 'video/mp4';
+
+            // 3) PRIMARY durable store — the permanent snapshot IndexedDB.
+            //    This is the DB that already survives hard refresh for the
+            //    slideshows, so it is the one store guaranteed to survive
+            //    for the video too. We write it FIRST and treat its success
+            //    as the definition of success.
+            let snapOk = false;
+            try {
+                snapOk = await _savePersistentSnapshot('user_video_' + email, {
+                    kind: 'dataurl',
+                    value: dataUrl,
+                    mime: mime,
+                    savedAt: Date.now()
+                });
+            } catch (e) { snapOk = false; }
+
+            // 4) Secondary mirror — localStorage. May be blocked or full on
+            //    some devices, but harmless to try.
+            try {
+                localStorage.setItem('wf_user_video_mirror_' + email, JSON.stringify({
+                    id: videoId,
+                    data: dataUrl,
+                    mime: mime,
+                    savedAt: Date.now()
+                }));
+            } catch (e) {
+                try {
+                    localStorage.removeItem('wf_user_image_mirror_' + email);
+                    localStorage.setItem('wf_user_video_mirror_' + email, JSON.stringify({
+                        id: videoId,
+                        data: dataUrl,
+                        mime: mime,
+                        savedAt: Date.now()
+                    }));
+                } catch (e2) { }
+            }
+
+            // 5) Tertiary mirror — per-user IndexedDB, new string format.
             try {
                 const db = await initUserStorageDB(email);
-                const ok = await new Promise((resolve) => {
+                await new Promise((resolve) => {
                     const tx = db.transaction([USER_VIDEOS_STORE], "readwrite");
                     tx.oncomplete = () => resolve(true);
                     tx.onerror = () => resolve(false);
                     tx.onabort = () => resolve(false);
                     try {
                         tx.objectStore(USER_VIDEOS_STORE).put({
-                            id: videoId, data: videoBlob, timestamp: Date.now()
+                            id: videoId,
+                            data: { kind: 'dataurl', value: dataUrl, mime: mime },
+                            timestamp: Date.now()
                         });
                     } catch (e) {
                         resolve(false);
                     }
                 });
-                return ok;
-            } catch (error) { return false; }
+            } catch (e) { }
+
+            // Success is defined by the permanent snapshot having the video.
+            return snapOk;
         }
 
         // In-memory mirror for the current session — covers the case where
@@ -7296,7 +7329,48 @@
         const __userVideoMemoryMirror = new Map();
 
         async function getUserVideo(email, videoId) {
-            // 1. Try IndexedDB
+            // Helper — turn whatever we find into a playable Blob.
+            const toPlayableBlob = async (dataUrl, mime) => {
+                try {
+                    const blob = await (await fetch(dataUrl)).blob();
+                    if (!blob.type || blob.type === 'application/octet-stream') {
+                        return new Blob([blob], { type: mime || 'video/mp4' });
+                    }
+                    return blob;
+                } catch (e) { return null; }
+            };
+
+            // 1) PRIMARY source — the permanent snapshot IndexedDB. This is
+            //    the same DB that reliably survives hard refresh for the
+            //    slideshows, so we read it FIRST. Nothing else in the app
+            //    clears this store.
+            try {
+                const snap = await _loadPersistentSnapshot('user_video_' + email);
+                if (snap && snap.kind === 'dataurl' && snap.value && snap.value.length > 32) {
+                    const playable = await toPlayableBlob(snap.value, snap.mime);
+                    if (playable) return playable;
+                }
+            } catch (e) { }
+
+            // 2) In-memory mirror (same session only)
+            const memKey = email + '::' + videoId;
+            if (__userVideoMemoryMirror.has(memKey)) {
+                return __userVideoMemoryMirror.get(memKey);
+            }
+
+            // 3) localStorage mirror
+            try {
+                const raw = localStorage.getItem('wf_user_video_mirror_' + email);
+                if (raw) {
+                    const parsed = JSON.parse(raw);
+                    if (parsed && parsed.data && typeof parsed.data === 'string' && parsed.data.length > 32) {
+                        const playable = await toPlayableBlob(parsed.data, parsed.mime);
+                        if (playable) return playable;
+                    }
+                }
+            } catch (e) { }
+
+            // 4) Per-user IndexedDB (new string format OR legacy Blob)
             try {
                 const db = await initUserStorageDB(email);
                 const tx = db.transaction([USER_VIDEOS_STORE], "readonly");
@@ -7306,44 +7380,14 @@
                     request.onsuccess = () => resolve(request.result ? request.result.data : null);
                     request.onerror = () => resolve(null);
                 });
-                if (idbResult) return idbResult;
-            } catch (error) { }
-
-            // 2. Fall back to the in-memory mirror (same session only)
-            const memKey = email + '::' + videoId;
-            if (__userVideoMemoryMirror.has(memKey)) {
-                const blob = __userVideoMemoryMirror.get(memKey);
-                // Self-heal: write it back into IndexedDB
-                try {
-                    const db = await initUserStorageDB(email);
-                    const tx = db.transaction([USER_VIDEOS_STORE], "readwrite");
-                    tx.objectStore(USER_VIDEOS_STORE).put({
-                        id: videoId, data: blob, timestamp: Date.now()
-                    });
-                } catch (e) { }
-                return blob;
-            }
-
-            // 3. Last resort: localStorage base64 mirror (small videos only).
-            //    Survives IndexedDB wipes on iOS/Android.
-            try {
-                const raw = localStorage.getItem('wf_user_video_mirror_' + email);
-                if (raw) {
-                    const parsed = JSON.parse(raw);
-                    if (parsed && parsed.data) {
-                        // Convert the data URL back to a Blob and self-heal IDB.
-                        const blob = await (await fetch(parsed.data)).blob();
-                        try {
-                            const db = await initUserStorageDB(email);
-                            const tx = db.transaction([USER_VIDEOS_STORE], "readwrite");
-                            tx.objectStore(USER_VIDEOS_STORE).put({
-                                id: videoId, data: blob, timestamp: Date.now()
-                            });
-                        } catch (e) { }
-                        return blob;
+                if (idbResult) {
+                    if (idbResult.kind === 'dataurl' && idbResult.value) {
+                        const playable = await toPlayableBlob(idbResult.value, idbResult.mime);
+                        if (playable) return playable;
                     }
+                    if (idbResult instanceof Blob) return idbResult;
                 }
-            } catch (e) { }
+            } catch (error) { }
 
             return null;
         }
@@ -10419,8 +10463,10 @@
             if (mediaVideo) mediaVideo.pause();
             clearVideoPosition();
 
-            // Clear the in-memory video mirror so the next user on this
-            // device doesn't inherit a stale blob from the previous session.
+            // Clear ONLY the in-memory mirror. The localStorage + IndexedDB
+            // copies stay so the same user sees their video after logging
+            // back in — they are keyed per email, so they never leak to
+            // another user account.
             try { __userVideoMemoryMirror.clear(); } catch (e) { }
 
             if (currentUserEmail) trackLoginEvent(currentUserEmail, 'logout', {});
@@ -10434,6 +10480,10 @@
             StorageManager.setItem(REMEMBERED_EMAIL_KEY, null);
             StorageManager.setItem(REMEMBERED_PASSWORD_KEY, null);
             StorageManager.setItem(REMEMBER_ME_ENABLED_KEY, null);
+            // NOTE: the per-user video snapshot in the permanent store is
+            // intentionally NOT cleared here. It is keyed by email, so it
+            // can never leak to a different user, and clearing it on logout
+            // would defeat the whole point of the fix.
 
             currentUserEmail = "";
             updateLoginButtonState();
@@ -10488,18 +10538,44 @@
                 if (userVideo) {
                     if (mediaVideo) {
                         armVideoRestore();
-                        // Re-wrap the blob with a MIME type if IndexedDB
-                        // dropped it — some browsers do this, and a blob URL
-                        // with no type will not decode in <video>.
-                        let playableBlob = userVideo;
+                        // Prefer the data URL from the permanent snapshot — the
+                        // one store that reliably survives hard refresh on this
+                        // device. It is a string, so it is never revoked and
+                        // never dropped.
+                        let srcToUse = null;
                         try {
-                            if (userVideo instanceof Blob && (!userVideo.type || userVideo.type === 'application/octet-stream')) {
-                                playableBlob = new Blob([userVideo], { type: 'video/mp4' });
+                            const snap = await _loadPersistentSnapshot('user_video_' + email);
+                            if (snap && snap.kind === 'dataurl' && snap.value && snap.value.length > 32) {
+                                srcToUse = snap.value;
                             }
                         } catch (e) { }
-                        mediaVideo.src = URL.createObjectURL(playableBlob);
-                        mediaVideo.load();
-                        mediaVideo.style.display = "block";
+                        // Fallback: localStorage mirror
+                        if (!srcToUse) {
+                            try {
+                                const raw = localStorage.getItem('wf_user_video_mirror_' + email);
+                                if (raw) {
+                                    const parsed = JSON.parse(raw);
+                                    if (parsed && parsed.data && typeof parsed.data === 'string' && parsed.data.length > 32) {
+                                        srcToUse = parsed.data;
+                                    }
+                                }
+                            } catch (e) { }
+                        }
+                        // Fallback: Blob → object URL (legacy path)
+                        if (!srcToUse) {
+                            let playableBlob = userVideo;
+                            try {
+                                if (userVideo instanceof Blob && (!userVideo.type || userVideo.type === 'application/octet-stream')) {
+                                    playableBlob = new Blob([userVideo], { type: 'video/mp4' });
+                                }
+                            } catch (e) { }
+                            try { srcToUse = URL.createObjectURL(playableBlob); } catch (e) { }
+                        }
+                        if (srcToUse) {
+                            mediaVideo.src = srcToUse;
+                            mediaVideo.load();
+                            mediaVideo.style.display = "block";
+                        }
                     }
                     if (videoPlaceholder) videoPlaceholder.style.display = "none";
                 } else if (globalWilliamVideo) {
@@ -11112,7 +11188,7 @@
 
         function _openPersistDB() {
             return new Promise((resolve, reject) => {
-                const req = indexedDB.open(PERSIST_STORE_DB, 1);
+                const req = indexedDB.open(PERSIST_STORE_DB, 2);
                 req.onerror = () => reject(req.error);
                 req.onsuccess = () => resolve(req.result);
                 req.onupgradeneeded = (ev) => {
@@ -11127,9 +11203,19 @@
         async function _savePersistentSnapshot(id, payload) {
             try {
                 const db = await _openPersistDB();
-                const tx = db.transaction([PERSIST_STORE_NAME], 'readwrite');
-                tx.objectStore(PERSIST_STORE_NAME).put({ id, payload, savedAt: Date.now() });
-                return true;
+                return await new Promise((resolve) => {
+                    const tx = db.transaction([PERSIST_STORE_NAME], 'readwrite');
+                    tx.oncomplete = () => resolve(true);
+                    tx.onerror = () => resolve(false);
+                    tx.onabort = () => resolve(false);
+                    try {
+                        tx.objectStore(PERSIST_STORE_NAME).put({
+                            id, payload, savedAt: Date.now()
+                        });
+                    } catch (e) {
+                        resolve(false);
+                    }
+                });
             } catch (e) { return false; }
         }
 
@@ -11139,7 +11225,12 @@
                 const tx = db.transaction([PERSIST_STORE_NAME], 'readonly');
                 const req = tx.objectStore(PERSIST_STORE_NAME).get(id);
                 return new Promise((resolve) => {
-                    req.onsuccess = () => resolve(req.result ? req.result.payload : null);
+                    req.onsuccess = () => {
+                        if (!req.result) return resolve(null);
+                        // Some older code stored a plain array for slideshows.
+                        // Return the payload as-is so both shapes work.
+                        resolve(req.result.payload);
+                    };
                     req.onerror = () => resolve(null);
                 });
             } catch (e) { return null; }
@@ -11531,13 +11622,30 @@
                 // Respect the user's manual mute choice — never override it.
                 if (typeof cityVideosMuted !== 'undefined' && cityVideosMuted === true) return;
 
-                document.querySelectorAll('.city-slide video').forEach(v => {
-                    try {
-                        v.muted = false;
-                        v.volume = 1.0;
-                        if (v.paused) v.play().catch(() => { });
-                    } catch (e) { }
+                // Only the ACTIVE slide's video may unmute or play.
+                // Every other video stays muted and paused. This is what
+                // stops the overlapping voices.
+                const allSlides = document.querySelectorAll('.city-slide');
+                const activeIndex = (typeof window.currentCitySlide === 'number')
+                    ? window.currentCitySlide : 0;
+
+                allSlides.forEach((s, i) => {
+                    const v = s.querySelector('video');
+                    if (!v) return;
+                    if (i === activeIndex) {
+                        try {
+                            v.muted = false;
+                            v.volume = 1.0;
+                            if (v.paused) v.play().catch(() => { });
+                        } catch (e) { }
+                    } else {
+                        try {
+                            v.pause();
+                            v.muted = true;
+                        } catch (e) { }
+                    }
                 });
+
                 const btn = document.querySelector('.city-slide-mute-btn');
                 if (btn) btn.innerHTML = '<i class="fas fa-volume-up"></i>';
             };
@@ -11671,27 +11779,26 @@
                 if (item.type === "video") {
                     const video = document.createElement("video");
                     video.src = resolveMediaSrc(item.data);
-                    // Start with the user's saved preference if it's UNMUTED,
-                    // otherwise start muted so the browser can autoplay.
-                    // Either way the correct state is re-asserted right after.
-                    video.muted = cityVideosMuted ? true : true;
+                    // EVERY video is created muted + paused. Only the active
+                    // slide is allowed to play, and only its audio is allowed
+                    // to be heard. This is the fix for overlapping voices.
+                    video.muted = true;
                     video.volume = 1.0;
                     video.loop = false;
                     video.playsInline = true;
                     video.preload = "auto";
-                    video.autoplay = true;
+                    video.autoplay = false;              // <-- was true; kills the storm
                     video.disablePictureInPicture = true;
+                    video.pause();                        // <-- guaranteed stopped at build
                     video.addEventListener("ended", () => moveToNextCitySlide());
                     video.onerror = function () {
                         slide.dataset.skip = '1';
                         if (index === window.currentCitySlide) setTimeout(moveToNextCitySlide, 100);
                     };
-                    // Re-assert the saved mute state as soon as metadata is ready
+                    // Never auto‑unmute on metadata — only moveToNextCitySlide
+                    // and the first‑play block are allowed to bring audio up.
                     video.addEventListener('loadedmetadata', () => {
-                        try {
-                            video.muted = cityVideosMuted;
-                            if (!cityVideosMuted) video.volume = 1.0;
-                        } catch (e) { }
+                        try { video.muted = true; video.volume = 1.0; } catch (e) { }
                     }, { once: true });
                     slide.appendChild(video);
                 } else {
@@ -11708,12 +11815,39 @@
             if (slides.length === 0) return;
             window.currentCitySlide = 0;
 
+            // HARD RULE: only the slide at window.currentCitySlide may play.
+            // Every other <video> is paused and muted right now so no
+            // background video can keep its audio running under the
+            // active slide or under an image slide.
+            const __wfSilenceAllExcept = (activeIndex) => {
+                slides.forEach((s, i) => {
+                    const v = s.querySelector('video');
+                    if (!v) return;
+                    if (i === activeIndex) return;
+                    try {
+                        v.pause();
+                        v.currentTime = 0;
+                        v.muted = true;
+                    } catch (e) { }
+                });
+            };
+            __wfSilenceAllExcept(0);
+
             function moveToNextCitySlide() {
                 const currentSlide = slides[window.currentCitySlide];
                 if (!currentSlide) return;
                 const currentVideo = currentSlide.querySelector("video");
-                if (currentVideo) { currentVideo.pause(); currentVideo.currentTime = 0; }
+                if (currentVideo) {
+                    try {
+                        currentVideo.pause();
+                        currentVideo.currentTime = 0;
+                        currentVideo.muted = true;    // hard kill of its audio
+                    } catch (e) { }
+                }
                 currentSlide.classList.remove("active");
+
+                // Belt‑and‑braces: make sure nothing else is still talking.
+                __wfSilenceAllExcept(-1);
 
                 let attempts = 0;
                 do {
@@ -11723,6 +11857,10 @@
 
                 const nextSlide = slides[window.currentCitySlide];
                 nextSlide.classList.add("active");
+
+                // A new slide becomes the only one with sound permission.
+                __wfSilenceAllExcept(window.currentCitySlide);
+
                 const nextVideo = nextSlide.querySelector("video");
                 if (nextVideo) {
                     // Start muted so autoplay is always allowed, then
@@ -11782,13 +11920,21 @@
                 citySlideshowInterval = setTimeout(moveToNextCitySlide, duration);
             }
 
-            const firstVideo = slides[0].querySelector("video");
+            // Only slide #0 is allowed to play. Every other city video was
+            // already paused by the build loop and by __wfSilenceAllExcept(0).
+            __wfSilenceAllExcept(0);
+
+            const firstSlide = slides[0];
+            const firstVideo = firstSlide.querySelector("video");
             if (firstVideo) {
                 // Start muted so autoplay is allowed, then restore the
                 // user's saved preference immediately.
                 firstVideo.muted = true;
                 firstVideo.volume = 1.0;
                 firstVideo.play().then(() => {
+                    // Re‑assert: while this video is playing, all siblings
+                    // must stay silent.
+                    __wfSilenceAllExcept(0);
                     try {
                         firstVideo.muted = cityVideosMuted;
                         if (!cityVideosMuted) firstVideo.volume = 1.0;
@@ -11814,12 +11960,26 @@
                 cityVideosMuted = !cityVideosMuted;
                 try { StorageManager.setItem("wf_city_muted", cityVideosMuted); } catch (err) { }
 
-                // Apply to every city video immediately
-                document.querySelectorAll(".city-slide video").forEach(v => {
-                    try {
-                        v.muted = cityVideosMuted;
-                        if (!cityVideosMuted) v.volume = 1.0;
-                    } catch (err) { }
+                // Apply ONLY to the active slide's video. Every other video
+                // stays paused and muted no matter what.
+                const allSlides = document.querySelectorAll(".city-slide");
+                const activeIndex = (typeof window.currentCitySlide === 'number')
+                    ? window.currentCitySlide : 0;
+
+                allSlides.forEach((s, i) => {
+                    const v = s.querySelector('video');
+                    if (!v) return;
+                    if (i === activeIndex) {
+                        try {
+                            v.muted = cityVideosMuted;
+                            if (!cityVideosMuted) v.volume = 1.0;
+                        } catch (err) { }
+                    } else {
+                        try {
+                            v.pause();
+                            v.muted = true;
+                        } catch (err) { }
+                    }
                 });
 
                 // Update the button icon on every mute button in the DOM
@@ -12257,8 +12417,14 @@
                 mediaVideo.playbackRate = 1.0;
                 armVideoRestore();
                 restoreVideoPosition();
-                mediaVideo.pause();
-                if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-play"></i>';
+                // Do NOT pause here. Pausing on every load was making the video
+                // look "lost" — it loaded, then instantly stopped. The user can
+                // pause it themselves; we leave it in whatever state it was.
+                if (playPauseBtn) {
+                    playPauseBtn.innerHTML = mediaVideo.paused
+                        ? '<i class="fas fa-play"></i>'
+                        : '<i class="fas fa-pause"></i>';
+                }
             });
             mediaVideo.addEventListener("play", () => {
                 if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-pause"></i>';
@@ -13381,15 +13547,20 @@
                     const email = currentUserEmail || window.__sessionRestoredEmail;
                     if (email) {
                         try {
-                            // Ensure the blob we save carries an explicit MIME
-                            // type — IndexedDB in some engines strips it, which
-                            // breaks playback after refresh.
+                            // Wrap the file with an explicit MIME type — some
+                            // browsers strip the type and the blob won't play
+                            // after a cold start.
                             let videoBlob = file;
                             try {
                                 if (file instanceof Blob && (!file.type || file.type === 'application/octet-stream')) {
                                     videoBlob = new Blob([file], { type: 'video/mp4' });
                                 }
                             } catch (e) { }
+
+                            // Save to BOTH localStorage (durable) and
+                            // IndexedDB (best-effort). saveUserVideo never
+                            // throws — it returns true if the durable copy
+                            // succeeded.
                             const saved = await saveUserVideo(
                                 email,
                                 "william_dashboard_video",
@@ -13398,7 +13569,7 @@
                             if (saved) {
                                 showSuccessNotification("Video Saved", "Saved to your device — it will survive a refresh.");
                             } else {
-                                showSuccessNotification("Video Saved (partial)", "Shown now, but persistence may have failed.");
+                                showSuccessNotification("Video Save Error", "Could not write to storage. Try a smaller video.");
                             }
                         } catch (err) {
                             console.error('[WFSMB] saveUserVideo failed:', err);
@@ -13410,18 +13581,12 @@
 
             initVideoControls();
 
-            // Critical: re-run loadUserMedia AFTER initVideoControls has
-            // bound all its listeners. On a hard refresh the boot block
-            // already ran loadUserMedia once — but at that point the
-            // <video> element had no loadedmetadata handler, so the saved
-            // blob URL was assigned to a cold element that could silently
-            // drop it. Re-running now guarantees the saved video paints
-            // onto a fully-wired element.
+            // Re-run loadUserMedia AFTER initVideoControls so the saved video
+            // paints onto a fully-wired element. We do NOT call restoreVideoPosition
+            // here (the loadedmetadata handler inside initVideoControls already does).
             const __bootEmail = currentUserEmail || window.__sessionRestoredEmail;
             if (__bootEmail) {
-                loadUserMedia(__bootEmail).then(() => {
-                    try { restoreVideoPosition(); } catch (e) { }
-                }).catch(() => { });
+                loadUserMedia(__bootEmail).catch(() => { });
             }
         }
 
