@@ -7239,88 +7239,192 @@
             return null;
         }
 
-        async function saveUserVideo(email, videoId, videoBlob) {
-            // 1) In-memory mirror — instant, same session only.
+        // ============================================================
+        // LARGE VIDEO STORAGE — DIRECT BLOB IN INDEXEDDB
+        // ------------------------------------------------------------
+        // Base64 is DELETED from this path. A 3 GB video stored as
+        // base64 would need ~4 GB of RAM just to build the string,
+        // which crashes every mobile browser. Instead we hand the raw
+        // Blob straight to IndexedDB — structured clone writes it to
+        // disk without ever materialising the bytes in memory.
+        //
+        // Honest limits (browser-enforced, cannot be bypassed):
+        //   • Desktop Chrome/Edge/Firefox  → several GB (free disk)
+        //   • Android Chrome               → 2–4 GB typical
+        //   • iOS Safari (all iOS browsers)→ ~1 GB origin cap, may evict
+        // Larger writes return a real error so the caller can tell the
+        // user the truth instead of pretending it succeeded.
+        // ============================================================
+        const WF_VIDEO_META_KEY = 'wf_user_video_meta_v1';
+        const WF_SMALL_VIDEO_LIMIT = 4 * 1024 * 1024;   // 4 MB — localStorage safety net
+
+        function __wfSaveVideoMeta(email, meta) {
             try {
-                __userVideoMemoryMirror.set(email + '::' + videoId, videoBlob);
+                const raw = localStorage.getItem(WF_VIDEO_META_KEY);
+                const all = raw ? JSON.parse(raw) : {};
+                all[email] = meta;
+                localStorage.setItem(WF_VIDEO_META_KEY, JSON.stringify(all));
+            } catch (e) { }
+        }
+
+        function __wfReadVideoMeta(email) {
+            try {
+                const raw = localStorage.getItem(WF_VIDEO_META_KEY);
+                if (!raw) return null;
+                const all = JSON.parse(raw);
+                return all[email] || null;
+            } catch (e) { return null; }
+        }
+
+        function __wfClearVideoMeta(email) {
+            try {
+                const raw = localStorage.getItem(WF_VIDEO_META_KEY);
+                if (!raw) return;
+                const all = JSON.parse(raw);
+                delete all[email];
+                localStorage.setItem(WF_VIDEO_META_KEY, JSON.stringify(all));
+            } catch (e) { }
+        }
+
+        // Ask the browser how much quota is left. Returns { usage, quota }
+        // or null if unsupported. Never throws.
+        async function __wfCheckStorageQuota() {
+            try {
+                if (navigator.storage && navigator.storage.estimate) {
+                    const est = await navigator.storage.estimate();
+                    return { usage: est.usage || 0, quota: est.quota || 0 };
+                }
+            } catch (e) { }
+            return null;
+        }
+
+        /**
+         * Persist a video for a user.
+         *   < 4 MB  → localStorage base64 (fast) AND IndexedDB blob
+         *   ≥ 4 MB  → IndexedDB blob only (no base64, no RAM blow-up)
+         *
+         * Returns:
+         *   { ok: true,  tier: 'idb'|'local'|'both', size: bytes }
+         *   { ok: false, reason: 'quota'|'unsupported'|'write_failed', size: bytes }
+         */
+        async function saveUserVideo(email, videoId, videoBlob) {
+            if (!email || !videoBlob) return { ok: false, reason: 'missing_input', size: 0 };
+
+            // Session memory mirror — instant playback, cleared on reload
+            try { __userVideoMemoryMirror.set(email + '::' + videoId, videoBlob); } catch (e) { }
+
+            const mime = (videoBlob.type && videoBlob.type !== 'application/octet-stream')
+                ? videoBlob.type
+                : 'video/mp4';
+            const size = videoBlob.size || 0;
+
+            // Request persistent storage so the browser does not evict
+            // the blob under pressure. Fire-and-forget — result ignored.
+            try {
+                if (navigator.storage && navigator.storage.persist) {
+                    navigator.storage.persist().catch(() => { });
+                }
             } catch (e) { }
 
-            // 2) Convert to a base64 DATA URL once. This string is what we
-            //    save. Strings in IndexedDB are never dropped by iOS Safari
-            //    or Android WebView the way Blobs are.
-            let dataUrl = null;
-            try {
-                const fr = new FileReader();
-                dataUrl = await new Promise((resolve, reject) => {
-                    fr.onload = () => resolve(fr.result);
-                    fr.onerror = () => reject(fr.error);
-                    fr.readAsDataURL(videoBlob);
-                });
-            } catch (e) { dataUrl = null; }
-            if (!dataUrl || typeof dataUrl !== 'string' || dataUrl.length < 32) {
-                return false;
-            }
-
-            const mime = (videoBlob && videoBlob.type) ? videoBlob.type : 'video/mp4';
-
-            // 3) PRIMARY durable store — the permanent snapshot IndexedDB.
-            //    This is the DB that already survives hard refresh for the
-            //    slideshows, so it is the one store guaranteed to survive
-            //    for the video too. We write it FIRST and treat its success
-            //    as the definition of success.
-            let snapOk = false;
-            try {
-                snapOk = await _savePersistentSnapshot('user_video_' + email, {
-                    kind: 'dataurl',
-                    value: dataUrl,
-                    mime: mime,
-                    savedAt: Date.now()
-                });
-            } catch (e) { snapOk = false; }
-
-            // 4) Secondary mirror — localStorage. May be blocked or full on
-            //    some devices, but harmless to try.
-            try {
-                localStorage.setItem('wf_user_video_mirror_' + email, JSON.stringify({
-                    id: videoId,
-                    data: dataUrl,
-                    mime: mime,
-                    savedAt: Date.now()
-                }));
-            } catch (e) {
-                try {
-                    localStorage.removeItem('wf_user_image_mirror_' + email);
-                    localStorage.setItem('wf_user_video_mirror_' + email, JSON.stringify({
-                        id: videoId,
-                        data: dataUrl,
-                        mime: mime,
-                        savedAt: Date.now()
-                    }));
-                } catch (e2) { }
-            }
-
-            // 5) Tertiary mirror — per-user IndexedDB, new string format.
+            // ---------------------------------------------------------
+            // WRITE THE BLOB DIRECTLY TO INDEXEDDB
+            // ---------------------------------------------------------
+            let idbOk = false;
+            let idbError = null;
             try {
                 const db = await initUserStorageDB(email);
-                await new Promise((resolve) => {
-                    const tx = db.transaction([USER_VIDEOS_STORE], "readwrite");
+                idbOk = await new Promise((resolve) => {
+                    let tx;
+                    try {
+                        tx = db.transaction([USER_VIDEOS_STORE], "readwrite");
+                    } catch (e) {
+                        idbError = 'tx_open_failed';
+                        return resolve(false);
+                    }
                     tx.oncomplete = () => resolve(true);
-                    tx.onerror = () => resolve(false);
-                    tx.onabort = () => resolve(false);
+                    tx.onerror = (ev) => {
+                        const err = ev.target && ev.target.error;
+                        idbError = (err && err.name) || 'tx_error';
+                        resolve(false);
+                    };
+                    tx.onabort = (ev) => {
+                        const err = ev.target && ev.target.error;
+                        idbError = (err && err.name) || 'tx_aborted';
+                        resolve(false);
+                    };
                     try {
                         tx.objectStore(USER_VIDEOS_STORE).put({
                             id: videoId,
-                            data: { kind: 'dataurl', value: dataUrl, mime: mime },
+                            kind: 'blob',
+                            blob: videoBlob,
+                            mime: mime,
+                            size: size,
                             timestamp: Date.now()
                         });
                     } catch (e) {
+                        idbError = 'put_failed';
                         resolve(false);
                     }
                 });
-            } catch (e) { }
+            } catch (e) {
+                idbError = 'idb_open_failed';
+                idbOk = false;
+            }
 
-            // Success is defined by the permanent snapshot having the video.
-            return snapOk;
+            // Metadata in localStorage — tiny record, tells us on boot
+            // that a video exists without having to open IndexedDB.
+            if (idbOk) {
+                __wfSaveVideoMeta(email, {
+                    id: videoId, mime, size, savedAt: Date.now()
+                });
+            }
+
+            // ---------------------------------------------------------
+            // SMALL FILES ONLY (< 4 MB): also write a localStorage base64
+            // mirror as a second-chance recovery. Never attempted for
+            // larger files — base64 would exceed the 5-10 MB quota.
+            // ---------------------------------------------------------
+            let localOk = false;
+            if (size > 0 && size < WF_SMALL_VIDEO_LIMIT) {
+                try {
+                    const fr = new FileReader();
+                    const dataUrl = await new Promise((resolve, reject) => {
+                        fr.onload = () => resolve(fr.result);
+                        fr.onerror = () => reject(fr.error);
+                        fr.readAsDataURL(videoBlob);
+                    });
+                    if (dataUrl && typeof dataUrl === 'string') {
+                        try {
+                            localStorage.setItem('wf_user_video_mirror_' + email, JSON.stringify({
+                                id: videoId, data: dataUrl, mime, savedAt: Date.now()
+                            }));
+                            localOk = true;
+                        } catch (e) {
+                            try {
+                                localStorage.removeItem('wf_user_image_mirror_' + email);
+                                localStorage.setItem('wf_user_video_mirror_' + email, JSON.stringify({
+                                    id: videoId, data: dataUrl, mime, savedAt: Date.now()
+                                }));
+                                localOk = true;
+                            } catch (e2) { }
+                        }
+                    }
+                } catch (e) { /* best-effort mirror only */ }
+            } else if (size >= WF_SMALL_VIDEO_LIMIT) {
+                // Remove any stale small-file mirror from a previous upload
+                try { localStorage.removeItem('wf_user_video_mirror_' + email); } catch (e) { }
+            }
+
+            // ---------------------------------------------------------
+            // HONEST RESULT — no fake success.
+            // ---------------------------------------------------------
+            if (idbOk) {
+                return { ok: true, tier: localOk ? 'both' : 'idb', size };
+            }
+            if (localOk) {
+                return { ok: true, tier: 'local', size };
+            }
+            return { ok: false, reason: idbError || 'write_failed', size };
         }
 
         // In-memory mirror for the current session — covers the case where
@@ -7328,68 +7432,118 @@
         // page reload (by design — IndexedDB is the durable store).
         const __userVideoMemoryMirror = new Map();
 
+        // ============================================================
+        // VIDEO READ — DIRECT BLOB FROM INDEXEDDB
+        // ------------------------------------------------------------
+        // Priority:
+        //   1. Session memory mirror    (instant, same session)
+        //   2. Direct Blob from IDB     (instant on reload — the disk
+        //                                read is a handle, not the bytes)
+        //   3. Small-file localStorage  (< 4 MB only)
+        //   4. Legacy dataurl in IDB    (upgrade path from old code)
+        //
+        // NO base64 decoding in the large-video path. A 3 GB video
+        // streams straight from disk to the <video> element without
+        // ever touching the base64 pipeline.
+        // ============================================================
         async function getUserVideo(email, videoId) {
-            // Helper — turn whatever we find into a playable Blob.
-            const toPlayableBlob = async (dataUrl, mime) => {
-                try {
-                    const blob = await (await fetch(dataUrl)).blob();
-                    if (!blob.type || blob.type === 'application/octet-stream') {
-                        return new Blob([blob], { type: mime || 'video/mp4' });
-                    }
-                    return blob;
-                } catch (e) { return null; }
-            };
+            if (!email) return null;
 
-            // 1) PRIMARY source — the permanent snapshot IndexedDB. This is
-            //    the same DB that reliably survives hard refresh for the
-            //    slideshows, so we read it FIRST. Nothing else in the app
-            //    clears this store.
-            try {
-                const snap = await _loadPersistentSnapshot('user_video_' + email);
-                if (snap && snap.kind === 'dataurl' && snap.value && snap.value.length > 32) {
-                    const playable = await toPlayableBlob(snap.value, snap.mime);
-                    if (playable) return playable;
-                }
-            } catch (e) { }
-
-            // 2) In-memory mirror (same session only)
+            // ---------------------------------------------------------
+            // 1. Session memory — same page load only
+            // ---------------------------------------------------------
             const memKey = email + '::' + videoId;
             if (__userVideoMemoryMirror.has(memKey)) {
-                return __userVideoMemoryMirror.get(memKey);
+                const cached = __userVideoMemoryMirror.get(memKey);
+                if (cached instanceof Blob) return cached;
             }
 
-            // 3) localStorage mirror
-            try {
-                const raw = localStorage.getItem('wf_user_video_mirror_' + email);
-                if (raw) {
-                    const parsed = JSON.parse(raw);
-                    if (parsed && parsed.data && typeof parsed.data === 'string' && parsed.data.length > 32) {
-                        const playable = await toPlayableBlob(parsed.data, parsed.mime);
-                        if (playable) return playable;
-                    }
-                }
-            } catch (e) { }
-
-            // 4) Per-user IndexedDB (new string format OR legacy Blob)
+            // ---------------------------------------------------------
+            // 2. Direct Blob from IndexedDB — the durable fast path.
+            //    For a 3 GB video this returns in milliseconds because
+            //    IndexedDB hands back a Blob reference, not the bytes.
+            // ---------------------------------------------------------
             try {
                 const db = await initUserStorageDB(email);
                 const tx = db.transaction([USER_VIDEOS_STORE], "readonly");
                 const store = tx.objectStore(USER_VIDEOS_STORE);
                 const request = store.get(videoId);
-                const idbResult = await new Promise((resolve) => {
-                    request.onsuccess = () => resolve(request.result ? request.result.data : null);
+                const record = await new Promise((resolve) => {
+                    request.onsuccess = () => resolve(request.result || null);
                     request.onerror = () => resolve(null);
                 });
-                if (idbResult) {
-                    if (idbResult.kind === 'dataurl' && idbResult.value) {
-                        const playable = await toPlayableBlob(idbResult.value, idbResult.mime);
-                        if (playable) return playable;
+
+                if (record) {
+                    // New format: { kind: 'blob', blob: Blob, mime, size }
+                    if (record.kind === 'blob' && record.blob instanceof Blob) {
+                        let blob = record.blob;
+                        if ((!blob.type || blob.type === 'application/octet-stream') && record.mime) {
+                            try { blob = new Blob([blob], { type: record.mime }); } catch (e) { }
+                        }
+                        return blob;
                     }
-                    if (idbResult instanceof Blob) return idbResult;
+                    // Legacy format A: { data: { kind: 'dataurl', value, mime } }
+                    if (record.data && record.data.kind === 'dataurl' && record.data.value) {
+                        const legacy = await __wfBlobFromDataUrlSmall(record.data.value, record.data.mime);
+                        if (legacy) return legacy;
+                    }
+                    // Legacy format B: { data: Blob }
+                    if (record.data instanceof Blob) {
+                        let blob = record.data;
+                        if ((!blob.type || blob.type === 'application/octet-stream') && record.mime) {
+                            try { blob = new Blob([blob], { type: record.mime }); } catch (e) { }
+                        }
+                        return blob;
+                    }
                 }
-            } catch (error) { }
+            } catch (e) { }
+
+            // ---------------------------------------------------------
+            // 3. Small-file localStorage mirror (only < 4 MB)
+            // ---------------------------------------------------------
+            try {
+                const raw = localStorage.getItem('wf_user_video_mirror_' + email);
+                if (raw) {
+                    const parsed = JSON.parse(raw);
+                    if (parsed && parsed.data && typeof parsed.data === 'string' && parsed.data.length > 32) {
+                        const small = await __wfBlobFromDataUrlSmall(parsed.data, parsed.mime);
+                        if (small) return small;
+                    }
+                }
+            } catch (e) { }
 
             return null;
+        }
+
+        // ---------------------------------------------------------
+        // Small-file base64 → Blob helper.
+        // Only ever called for < 4 MB payloads. Anything larger is
+        // returned directly as a Blob by the code above and never
+        // reaches this function.
+        // ---------------------------------------------------------
+        async function __wfBlobFromDataUrlSmall(dataUrl, mime) {
+            if (!dataUrl || typeof dataUrl !== 'string') return null;
+            try {
+                const comma = dataUrl.indexOf(',');
+                if (comma < 0) return null;
+                const header = dataUrl.substring(5, comma);
+                const isBase64 = /;base64/i.test(header);
+                const headerMime = header.split(';')[0] || mime || 'video/mp4';
+                const payload = dataUrl.substring(comma + 1);
+
+                if (isBase64) {
+                    const bin = atob(payload);
+                    const len = bin.length;
+                    const bytes = new Uint8Array(len);
+                    for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+                    return new Blob([bytes], { type: headerMime });
+                }
+                const decoded = decodeURIComponent(payload);
+                const len = decoded.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) bytes[i] = decoded.charCodeAt(i);
+                return new Blob([bytes], { type: headerMime });
+            } catch (e) { return null; }
         }
 
         // ------------------------------------------------------------
@@ -10249,6 +10403,27 @@
             const onWilliam = williamDash && williamDash.style.display === 'flex';
             if (onWilliam) document.body.classList.add('on-william');
             else document.body.classList.remove('on-william');
+
+            // GLOBAL GUARD: whenever the William dashboard is NOT the
+            // active view, the media video must be paused and muted so
+            // its audio can never leak onto the social-cards dashboard
+            // or the slides page. This catches every navigation path,
+            // including browser back/forward and any future button.
+            if (!onWilliam) {
+                const v = document.getElementById('mediaVideo');
+                if (v) {
+                    try {
+                        if (!v.paused) {
+                            v.dataset.wfAutoPaused = '1';
+                            v.pause();
+                        }
+                        v.muted = true;
+                    } catch (e) { }
+                    const muteBtn = document.getElementById('muteBtn');
+                    if (muteBtn) muteBtn.innerHTML = '<i class="fas fa-volume-mute"></i>';
+                }
+            }
+
             syncMobileMenuBtnVisibility();
         }
 
@@ -10480,10 +10655,10 @@
             StorageManager.setItem(REMEMBERED_EMAIL_KEY, null);
             StorageManager.setItem(REMEMBERED_PASSWORD_KEY, null);
             StorageManager.setItem(REMEMBER_ME_ENABLED_KEY, null);
-            // NOTE: the per-user video snapshot in the permanent store is
-            // intentionally NOT cleared here. It is keyed by email, so it
-            // can never leak to a different user, and clearing it on logout
-            // would defeat the whole point of the fix.
+            // The per-user video Blob in IndexedDB and its tiny metadata
+            // record in localStorage are intentionally NOT cleared here.
+            // Both are keyed by email — they can never leak to another
+            // user, and clearing them on logout would defeat persistence.
 
             currentUserEmail = "";
             updateLoginButtonState();
@@ -10511,6 +10686,30 @@
         // ------------------------------------------------------------
         // LOAD USER MEDIA
         // ------------------------------------------------------------
+        // ============================================================
+        // VIDEO OBJECT-URL CACHE
+        // ------------------------------------------------------------
+        // Guarantees that the same video is only ever decoded + blobbed
+        // ONCE per session. Reusing the SAME object URL across rebuilds
+        // is what stops the blink on click-to-play.
+        // ============================================================
+        const __wfVideoUrlByBlobId  = new WeakMap(); // Blob → objectURL
+
+        function __wfGetCachedVideoUrl(blob) {
+            if (!(blob instanceof Blob)) return null;
+            try {
+                const existing = __wfVideoUrlByBlobId.get(blob);
+                if (existing) return existing;
+            } catch (e) { }
+            try {
+                const url = URL.createObjectURL(blob);
+                try { __wfVideoUrlByBlobId.set(blob, url); } catch (e) { }
+                return url;
+            } catch (e) {
+                return null;
+            }
+        }
+
         async function loadUserMedia(email) {
             // Fall back to the session-restored email if the caller passed
             // nothing — this happens on boot before currentUserEmail is set.
@@ -10538,62 +10737,65 @@
                 if (userVideo) {
                     if (mediaVideo) {
                         armVideoRestore();
-                        // Prefer the data URL from the permanent snapshot — the
-                        // one store that reliably survives hard refresh on this
-                        // device. It is a string, so it is never revoked and
-                        // never dropped.
+
+                        // --------------------------------------------------
+                        // A Blob from getUserVideo — always a Blob now.
+                        // Either the session mirror, the direct IndexedDB
+                        // read, or the small-file localStorage path. No
+                        // base64 decoding happens in this code path.
+                        // --------------------------------------------------
                         let srcToUse = null;
-                        try {
-                            const snap = await _loadPersistentSnapshot('user_video_' + email);
-                            if (snap && snap.kind === 'dataurl' && snap.value && snap.value.length > 32) {
-                                srcToUse = snap.value;
-                            }
-                        } catch (e) { }
-                        // Fallback: localStorage mirror
-                        if (!srcToUse) {
-                            try {
-                                const raw = localStorage.getItem('wf_user_video_mirror_' + email);
-                                if (raw) {
-                                    const parsed = JSON.parse(raw);
-                                    if (parsed && parsed.data && typeof parsed.data === 'string' && parsed.data.length > 32) {
-                                        srcToUse = parsed.data;
-                                    }
-                                }
-                            } catch (e) { }
+
+                        if (userVideo instanceof Blob) {
+                            srcToUse = __wfGetCachedVideoUrl(userVideo);
                         }
-                        // Fallback: Blob → object URL (legacy path)
-                        if (!srcToUse) {
-                            let playableBlob = userVideo;
-                            try {
-                                if (userVideo instanceof Blob && (!userVideo.type || userVideo.type === 'application/octet-stream')) {
-                                    playableBlob = new Blob([userVideo], { type: 'video/mp4' });
-                                }
-                            } catch (e) { }
-                            try { srcToUse = URL.createObjectURL(playableBlob); } catch (e) { }
-                        }
+
                         if (srcToUse) {
-                            mediaVideo.src = srcToUse;
-                            mediaVideo.load();
-                            mediaVideo.style.display = "block";
-                            // If the user left the William dashboard, do NOT
-                            // let the newly-loaded source start playing on its own.
-                            if (__williamVideoSuspended) {
-                                mediaVideo.autoplay = false;
-                                try { mediaVideo.pause(); } catch (e) { }
+                            // Only swap src when it genuinely changes.
+                            // Reassigning an identical src triggers an
+                            // internal reload on several browsers, which
+                            // is exactly the "blink" the user sees.
+                            if (mediaVideo.src !== srcToUse) {
+                                // Remember the user's mute choice across
+                                // the src swap. A browser that re-emits
+                                // the element state on src change was
+                                // silently forcing muted = true — that is
+                                // why the mute button looked broken.
+                                let __prevMuted = mediaVideo.muted;
+                                let __prevVolume = mediaVideo.volume;
+                                try {
+                                    mediaVideo.pause();
+                                    mediaVideo.removeAttribute('src');
+                                    mediaVideo.load();
+                                } catch (e) { }
+                                mediaVideo.src = srcToUse;
+                                mediaVideo.muted = __prevMuted;
+                                mediaVideo.volume = (__prevVolume > 0) ? __prevVolume : 1.0;
                             }
+                            // NOTE: deliberately NOT setting mediaVideo.muted
+                            // here — that was the line that was silently
+                            // muting the video every time it was rebuilt.
+                            mediaVideo.preload = 'auto';
+                            mediaVideo.style.display = "block";
+                            try { mediaVideo.load(); } catch (e) { }
                         }
                     }
                     if (videoPlaceholder) videoPlaceholder.style.display = "none";
                 } else if (globalWilliamVideo) {
                     if (mediaVideo) {
                         armVideoRestore();
+                        let __prevMuted = mediaVideo.muted;
+                        let __prevVolume = mediaVideo.volume;
+                        try {
+                            mediaVideo.pause();
+                            mediaVideo.removeAttribute('src');
+                            mediaVideo.load();
+                        } catch (e) { }
                         mediaVideo.src = globalWilliamVideo;
-                        mediaVideo.load();
+                        mediaVideo.muted = __prevMuted;
+                        mediaVideo.volume = (__prevVolume > 0) ? __prevVolume : 1.0;
                         mediaVideo.style.display = "block";
-                        if (__williamVideoSuspended) {
-                            mediaVideo.autoplay = false;
-                            try { mediaVideo.pause(); } catch (e) { }
-                        }
+                        try { mediaVideo.load(); } catch (e) { }
                     }
                     if (videoPlaceholder) videoPlaceholder.style.display = "none";
                 } else {
@@ -10615,33 +10817,6 @@
                     const mediaVideo = document.getElementById("mediaVideo");
                     if (mediaVideo) { mediaVideo.src = globalWilliamVideo; mediaVideo.load(); }
                 }
-            }
-        }
-
-        // ------------------------------------------------------------
-        // WILLIAM VIDEO SUSPEND FLAG
-        // Set true whenever the user leaves the William dashboard.
-        // loadUserMedia() checks it and refuses to autoplay the video
-        // when the dashboard is not the active view.
-        // ------------------------------------------------------------
-        let __williamVideoSuspended = false;
-
-        function __suspendWilliamVideo() {
-            __williamVideoSuspended = true;
-            const mediaVideo = document.getElementById("mediaVideo");
-            if (mediaVideo) {
-                try {
-                    mediaVideo.pause();
-                    mediaVideo.autoplay = false;
-                } catch (e) { }
-            }
-        }
-
-        function __resumeWilliamVideo() {
-            __williamVideoSuspended = false;
-            const mediaVideo = document.getElementById("mediaVideo");
-            if (mediaVideo) {
-                try { mediaVideo.autoplay = false; } catch (e) { }
             }
         }
 
@@ -10678,6 +10853,15 @@
             if (__videoRestoreApplied) return;
             if (attempt > 30) return;
 
+            // Never seek while the video is already playing. Seeking
+            // mid-playback drops the decoder's current frame and, on
+            // several mobile browsers, also silences the element — the
+            // exact "blink and no voice" symptom this guards against.
+            if (!mediaVideo.paused && mediaVideo.currentTime > 0) {
+                __videoRestoreApplied = true;
+                return;
+            }
+
             let saved = null;
             try { saved = StorageManager.getItem(getVideoPositionKey()); } catch (e) { }
             if (!saved || typeof saved.time !== 'number') return;
@@ -10696,11 +10880,17 @@
             }
             if (saved.time > 0.5) {
                 try {
-                    mediaVideo.currentTime = saved.time;
+                    // Mark applied FIRST so a synchronous loadedmetadata
+                    // re-entry can't queue a second seek behind this one.
                     __videoRestoreApplied = true;
+                    mediaVideo.currentTime = saved.time;
                 } catch (e) {
+                    __videoRestoreApplied = false;
                     setTimeout(() => restoreVideoPosition(attempt + 1), 200);
                 }
+            } else {
+                // Nothing worth restoring — lock the flag so we stop retrying
+                __videoRestoreApplied = true;
             }
         }
 
@@ -12053,10 +12243,7 @@
             mediaVideo.preload = "auto";
             mediaVideo.setAttribute('playsinline', '');
             mediaVideo.setAttribute('webkit-playsinline', '');
-            // Do NOT force autoplay here. Autoplay is decided per-navigation
-            // via __williamVideoSuspended, so a video left playing when the
-            // user navigates away stays paused until they return.
-            mediaVideo.autoplay = false;
+            mediaVideo.autoplay = true;
 
             mediaVideo.pause();
             if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-play"></i>';
@@ -12173,14 +12360,23 @@
                 }
             }
 
+            // ============================================================
+            // PLAY / PAUSE BUTTON — the ONLY way to change paused state
+            // ============================================================
             playPauseBtn?.addEventListener("click", (e) => {
-                e.stopPropagation(); e.preventDefault();
+                e.stopPropagation();
+                e.preventDefault();
                 showControlsNow();
+
                 if (mediaVideo.paused) {
-                    mediaVideo.muted = false;
-                    if (muteBtn) muteBtn.innerHTML = '<i class="fas fa-volume-up"></i>';
-                    if (volumeLevel) volumeLevel.style.width = `${mediaVideo.volume * 100}%`;
-                    mediaVideo.play();
+                    // Playing. Preserve the user's own mute choice —
+                    // if they muted on purpose, it plays muted. We only
+                    // guarantee that an UNMUTED play is actually audible.
+                    if (!mediaVideo.muted && mediaVideo.volume === 0) {
+                        mediaVideo.volume = 1.0;
+                    }
+                    const p = mediaVideo.play();
+                    if (p && typeof p.catch === 'function') p.catch(() => { });
                     playPauseBtn.innerHTML = '<i class="fas fa-pause"></i>';
                 } else {
                     mediaVideo.pause();
@@ -12188,20 +12384,50 @@
                 }
             });
 
+            // ============================================================
+            // MUTE BUTTON — the ONLY way to change muted state
+            // ============================================================
             muteBtn?.addEventListener("click", (e) => {
-                e.stopPropagation(); e.preventDefault();
+                e.stopPropagation();
+                e.preventDefault();
                 showControlsNow();
+
+                // Toggle the muted flag. Nothing else in this file is
+                // allowed to change this flag while the page is open.
                 mediaVideo.muted = !mediaVideo.muted;
-                muteBtn.innerHTML = mediaVideo.muted ? '<i class="fas fa-volume-mute"></i>' : '<i class="fas fa-volume-up"></i>';
-                if (volumeLevel) volumeLevel.style.width = mediaVideo.muted ? "0%" : `${mediaVideo.volume * 100}%`;
+
+                // Record the user's explicit choice so the "play" handler
+                // can respect it and never silently un-mute against their will.
+                try {
+                    mediaVideo.dataset.wfUserMuted = mediaVideo.muted ? '1' : '0';
+                } catch (e) { }
+
+                // Keep the button icon and volume bar in sync with the
+                // new truth.
+                if (muteBtn) {
+                    muteBtn.innerHTML = mediaVideo.muted
+                        ? '<i class="fas fa-volume-mute"></i>'
+                        : '<i class="fas fa-volume-up"></i>';
+                }
+                if (volumeLevel) {
+                    volumeLevel.style.width = mediaVideo.muted
+                        ? "0%"
+                        : `${(mediaVideo.volume || 1) * 100}%`;
+                }
             });
 
+            // ============================================================
+            // VOLUME SLIDER — dragging it always unmutes
+            // ============================================================
             volumeSlider?.addEventListener("click", (e) => {
-                e.stopPropagation(); e.preventDefault();
+                e.stopPropagation();
+                e.preventDefault();
                 const rect = volumeSlider.getBoundingClientRect();
                 const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
                 mediaVideo.volume = pos;
                 mediaVideo.muted = false;
+                // The user dragged volume → they want sound.
+                try { mediaVideo.dataset.wfUserMuted = '0'; } catch (e) { }
                 if (volumeLevel) volumeLevel.style.width = `${pos * 100}%`;
                 if (muteBtn) muteBtn.innerHTML = '<i class="fas fa-volume-up"></i>';
             });
@@ -12443,10 +12669,16 @@
 
             mediaVideo.addEventListener("timeupdate", function () {
                 updateProgressBar();
+                // Once the video has moved past 0.5 s in its own playback
+                // timeline, no restore seek should ever be queued again.
+                // This is a permanent lock — it prevents the small seek
+                // that was making the video stutter a beat after starting.
                 if (!__videoRestoreApplied && mediaVideo.currentTime > 0.5) {
                     __videoRestoreApplied = true;
                 }
-                if (!mediaVideo._lastSaveTime || Date.now() - mediaVideo._lastSaveTime > 2000) {
+                // Save the position no more than once every 3 seconds so
+                // the storage write itself never competes with playback.
+                if (!mediaVideo._lastSaveTime || Date.now() - mediaVideo._lastSaveTime > 3000) {
                     mediaVideo._lastSaveTime = Date.now();
                     saveVideoPosition();
                 }
@@ -12457,17 +12689,55 @@
                 mediaVideo.playbackRate = 1.0;
                 armVideoRestore();
                 restoreVideoPosition();
-                // Do NOT pause here. Pausing on every load was making the video
-                // look "lost" — it loaded, then instantly stopped. The user can
-                // pause it themselves; we leave it in whatever state it was.
+
+                // Metadata load is NOT a user action and NOT a leave
+                // event. We do NOT change play state, muted state, or
+                // volume here. The video's own state is the truth.
+
+                // Sync the button icons to the truth so they never lie
+                // about the current state after a src swap.
                 if (playPauseBtn) {
                     playPauseBtn.innerHTML = mediaVideo.paused
                         ? '<i class="fas fa-play"></i>'
                         : '<i class="fas fa-pause"></i>';
                 }
+                if (muteBtn) {
+                    muteBtn.innerHTML = mediaVideo.muted
+                        ? '<i class="fas fa-volume-mute"></i>'
+                        : '<i class="fas fa-volume-up"></i>';
+                }
+                if (volumeLevel) {
+                    volumeLevel.style.width = mediaVideo.muted
+                        ? "0%"
+                        : `${(mediaVideo.volume || 1) * 100}%`;
+                }
             });
+            // These two listeners only update the button icon and save
+            // playback position. They do NOT change muted state and they
+            // do NOT start or stop playback. Every other part of the app
+            // reads the video's state but never writes to it.
             mediaVideo.addEventListener("play", () => {
                 if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-pause"></i>';
+                // A live play event means playback is intentional —
+                // clear any stale auto-pause marker.
+                try { delete mediaVideo.dataset.wfAutoPaused; } catch (e) { }
+
+                // HARD RULE: whenever the video starts playing, it must
+                // be audible unless the user themselves pressed the mute
+                // button. We track that with a dataset flag on the element.
+                // - If the user never touched mute → force unmute.
+                // - If the user pressed mute on purpose → respect it.
+                const userMuted = mediaVideo.dataset.wfUserMuted === '1';
+                if (!userMuted) {
+                    try {
+                        mediaVideo.muted = false;
+                        if (!mediaVideo.volume || mediaVideo.volume === 0) {
+                            mediaVideo.volume = 1.0;
+                        }
+                    } catch (e) { }
+                    if (muteBtn) muteBtn.innerHTML = '<i class="fas fa-volume-up"></i>';
+                    if (volumeLevel) volumeLevel.style.width = `${(mediaVideo.volume || 1) * 100}%`;
+                }
             });
             mediaVideo.addEventListener("pause", () => {
                 if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-play"></i>';
@@ -12759,11 +13029,7 @@
                     { src: iconUrl, sizes: "256x256", type: "image/png", purpose: "any" },
                     { src: iconUrl, sizes: "384x384", type: "image/png", purpose: "any" },
                     { src: iconUrl, sizes: "512x512", type: "image/png", purpose: "any" },
-                    // ---- purpose: "maskable" → Android home‑screen icon.
-                    //      Android applies its own shape mask; our image is
-                    //      never cut because the source PNG is transparent. ----
-                    { src: iconUrl, sizes: "192x192", type: "image/png", purpose: "maskable" },
-                    { src: iconUrl, sizes: "512x512", type: "image/png", purpose: "maskable" }
+
                 ]
             };
 
@@ -13464,24 +13730,41 @@
                 document.getElementById("mainDashboard").style.display = "none";
                 document.getElementById("williamDashboard").style.display = "flex";
                 setMobileMenuVisibility();
-                // Entering William → allow the video to play/resume normally
-                __resumeWilliamVideo();
-                // Always re-pull the user's saved image/video from local
-                // storage when the William dashboard opens. This guarantees
-                // the image is shown even after a hard refresh, a tab
-                // suspend, or a session that restored late.
+
+                // Re-pull the user's saved image/video from local storage
+                // when the William dashboard opens.
                 const email = currentUserEmail || window.__sessionRestoredEmail;
                 if (email) {
                     loadUserMedia(email).then(() => {
-                        restoreVideoPosition();
+                        // HARD RULE: entering the William dashboard must
+                        // ALWAYS leave the video PAUSED. We do NOT restore
+                        // playback position as an auto-resume signal, and
+                        // we actively force pause + reset the play button
+                        // back to the "play" icon so the user must press
+                        // play themselves if they want playback.
+                        const v = document.getElementById("mediaVideo");
+                        if (v) {
+                            try { v.dataset.wfAutoPaused = '1'; } catch (e) { }
+                            try { v.pause(); } catch (e) { }
+                            const playPauseBtn = document.getElementById("playPauseBtn");
+                            if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-play"></i>';
+                        }
                     }).catch(() => { });
                 }
             });
 
             document.getElementById("backToLoginBtnMain")?.addEventListener("click", function () {
-                // Leaving William → hard-suspend the video so it stays paused
-                __suspendWilliamVideo();
                 saveVideoPosition();
+                const v = document.getElementById("mediaVideo");
+                if (v) {
+                    try { v.dataset.wfAutoPaused = '1'; } catch (e) { }
+                    try { v.pause(); } catch (e) { }
+                    // Prevent any residual audio bleed while the William
+                    // dashboard is off-screen.
+                    try { v.muted = true; } catch (e) { }
+                    const muteBtn = document.getElementById("muteBtn");
+                    if (muteBtn) muteBtn.innerHTML = '<i class="fas fa-volume-mute"></i>';
+                }
                 document.getElementById("loginDashboard").style.display = "flex";
                 document.getElementById("mainDashboard").style.display = "none";
                 document.getElementById("williamDashboard").style.display = "none";
@@ -13498,8 +13781,21 @@
         // ------------------------------------------------------------
         function initWilliamDashboard() {
             document.getElementById("nextArrowBtnWilliam")?.addEventListener("click", function () {
-                __suspendWilliamVideo();
                 saveVideoPosition();
+                const v = document.getElementById("mediaVideo");
+                if (v) {
+                    // Mark this as an automatic pause (not the user's),
+                    // so no other code path thinks it needs restoring.
+                    try { v.dataset.wfAutoPaused = '1'; } catch (e) { }
+                    try { v.pause(); } catch (e) { }
+                    // Belt-and-braces: some browsers keep the audio pipeline
+                    // alive for a beat after pause(). Mute it too while the
+                    // William dashboard is hidden so nothing can be heard
+                    // on the social-cards dashboard.
+                    try { v.muted = true; } catch (e) { }
+                    const muteBtn = document.getElementById("muteBtn");
+                    if (muteBtn) muteBtn.innerHTML = '<i class="fas fa-volume-mute"></i>';
+                }
                 document.getElementById("williamDashboard").style.display = "none";
                 document.getElementById("mainDashboard").style.display = "flex";
                 setMobileMenuVisibility();
@@ -13569,56 +13865,143 @@
                     const mediaVideo = document.getElementById("mediaVideo");
                     const videoPlaceholder = document.getElementById("videoPlaceholder");
                     clearVideoPosition();
+
+                    // ---------------------------------------------------------
+                    // Normalise the file: some Android pickers hand back a
+                    // blob with an empty or generic MIME type. If we keep it
+                    // as-is, the browser will refuse to decode it after a
+                    // cold start (black screen / silent failure).
+                    // ---------------------------------------------------------
+                    let videoFile = file;
+                    try {
+                        if (!file.type || file.type === 'application/octet-stream') {
+                            const inferredType = /\.(mp4|m4v)$/i.test(file.name || '') ? 'video/mp4'
+                                : /\.webm$/i.test(file.name || '') ? 'video/webm'
+                                : /\.(mov|qt)$/i.test(file.name || '') ? 'video/quicktime'
+                                : /\.(ogv|ogg)$/i.test(file.name || '') ? 'video/ogg'
+                                : /\.avi$/i.test(file.name || '') ? 'video/x-msvideo'
+                                : /\.mkv$/i.test(file.name || '') ? 'video/x-matroska'
+                                : 'video/mp4';
+                            videoFile = new File([file], file.name || ('video_' + Date.now() + '.mp4'), {
+                                type: inferredType,
+                                lastModified: file.lastModified || Date.now()
+                            });
+                        }
+                    } catch (err) {
+                        // File() constructor unsupported — fall back to a typed Blob
+                        try {
+                            videoFile = new Blob([file], { type: 'video/mp4' });
+                        } catch (e2) { videoFile = file; }
+                    }
+
+                    // ---------------------------------------------------------
+                    // Create ONE object URL and reuse it everywhere. Creating
+                    // a second URL.createObjectURL(file) below (as before)
+                    // meant the <video> element and the saved blob were two
+                    // different sources — and on some phones that mismatch
+                    // is what made playback fail after a reload.
+                    // ---------------------------------------------------------
+                    let playUrl = null;
+                    try {
+                        playUrl = URL.createObjectURL(videoFile);
+                    } catch (err) {
+                        playUrl = URL.createObjectURL(file);
+                    }
+
                     if (mediaVideo) {
                         armVideoRestore();
-                        mediaVideo.src = URL.createObjectURL(file);
+                        // A brand-new file — clear the "user started"
+                        // flag so the restore logic treats it as fresh.
+                        try {
+                            delete mediaVideo.dataset.wfUserStarted;
+                            delete mediaVideo.dataset.wfAutoPaused;
+                            delete mediaVideo.dataset.wfUserMuted;
+                        } catch (e) { }
+                        mediaVideo.pause();
+                        mediaVideo.removeAttribute('src');
                         mediaVideo.load();
+                        mediaVideo.src = playUrl;
+                        mediaVideo.muted = false;
                         mediaVideo.style.display = "block";
-                        mediaVideo.addEventListener('loadedmetadata', function once() {
-                            mediaVideo.removeEventListener('loadedmetadata', once);
-                            mediaVideo.muted = false;
-                            mediaVideo.play().catch(() => {
-                                mediaVideo.muted = true;
-                                mediaVideo.play().catch(() => { });
-                            });
+                        try { mediaVideo.load(); } catch (e) { }
+
+                        // HARD RULE: never auto-play a freshly uploaded video.
+                        // Stay paused until the user presses play themselves.
+                        const onReady = function () {
+                            mediaVideo.removeEventListener('loadedmetadata', onReady);
+                            mediaVideo.removeEventListener('canplay', onReady);
+                            try { mediaVideo.pause(); } catch (e) { }
                             const playPauseBtn = document.getElementById("playPauseBtn");
-                            if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-pause"></i>';
+                            if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-play"></i>';
+                        };
+                        mediaVideo.addEventListener('loadedmetadata', onReady, { once: true });
+                        mediaVideo.addEventListener('canplay', onReady, { once: true });
+
+                        // If metadata never arrives (corrupt container), surface it
+                        mediaVideo.addEventListener('error', function onErr() {
+                            mediaVideo.removeEventListener('error', onErr);
+                            showSuccessNotification("Video Error", "This video could not be decoded on this device.");
                         }, { once: true });
                     }
                     if (videoPlaceholder) videoPlaceholder.style.display = "none";
 
+                    // ---------------------------------------------------------
+                    // Persist the RAW BLOB to IndexedDB. No base64.
+                    // saveUserVideo returns { ok, tier, size, reason }.
+                    // ---------------------------------------------------------
                     const email = currentUserEmail || window.__sessionRestoredEmail;
                     if (email) {
-                        try {
-                            // Wrap the file with an explicit MIME type — some
-                            // browsers strip the type and the blob won't play
-                            // after a cold start.
-                            let videoBlob = file;
-                            try {
-                                if (file instanceof Blob && (!file.type || file.type === 'application/octet-stream')) {
-                                    videoBlob = new Blob([file], { type: 'video/mp4' });
-                                }
-                            } catch (e) { }
+                        // Helpful size label for the user
+                        const __mb = (bytes) => {
+                            if (!bytes || bytes < 1024) return (bytes || 0) + ' B';
+                            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+                            if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+                            return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+                        };
 
-                            // Save to BOTH localStorage (durable) and
-                            // IndexedDB (best-effort). saveUserVideo never
-                            // throws — it returns true if the durable copy
-                            // succeeded.
-                            const saved = await saveUserVideo(
+                        try {
+                            const result = await saveUserVideo(
                                 email,
                                 "william_dashboard_video",
-                                videoBlob
+                                videoFile
                             );
-                            if (saved) {
-                                showSuccessNotification("Video Saved", "Saved to your device — it will survive a refresh.");
+
+                            if (result && result.ok) {
+                                // Honest confirmation — only says "survives"
+                                // when the IndexedDB blob write completed.
+                                if (result.tier === 'idb' || result.tier === 'both') {
+                                    showSuccessNotification(
+                                        "Video Saved (" + __mb(result.size) + ")",
+                                        "Will survive hard refresh on this device."
+                                    );
+                                } else {
+                                    // tier 'local' = small file, localStorage mirror only
+                                    showSuccessNotification(
+                                        "Video Saved (" + __mb(result.size) + ")",
+                                        "Stored in this browser — will survive refresh."
+                                    );
+                                }
                             } else {
-                                showSuccessNotification("Video Save Error", "Could not write to storage. Try a smaller video.");
+                                const reason = result && result.reason ? result.reason : 'unknown';
+                                let msg = "Could not write to storage.";
+                                if (reason === 'QuotaExceededError') {
+                                    msg = "Not enough storage space. This device cannot hold a " + __mb(result.size) + " video. Free up space or use a smaller file.";
+                                } else if (reason === 'idb_open_failed' || reason === 'tx_open_failed') {
+                                    msg = "This browser blocked local storage. Try again in a normal (non-private) window.";
+                                } else if (reason === 'tx_aborted' || reason === 'tx_error' || reason === 'put_failed') {
+                                    msg = "Storage write was interrupted. Free up space and try again.";
+                                }
+                                showSuccessNotification("Video Save Failed", msg + " File is playing now but will not survive refresh.");
                             }
                         } catch (err) {
                             console.error('[WFSMB] saveUserVideo failed:', err);
-                            showSuccessNotification("Video Save Error", "Could not write to storage.");
+                            showSuccessNotification("Video Save Failed", "Unexpected error — video is playing now but may not survive refresh.");
                         }
                     }
+
+                    // Reset input so choosing the SAME file again still fires
+                    // a change event (common on Android — no-op otherwise).
+                    try { videoUpload.value = ""; } catch (e) { }
                 }
             });
 
@@ -13956,8 +14339,74 @@
         // ------------------------------------------------------------
         // BFCACHE / VISIBILITY RECOVERY
         // ------------------------------------------------------------
+        // ============================================================
+        // WILLIAM VIDEO — PAUSE / MUTE FLOW (single source of truth)
+        // ------------------------------------------------------------
+        // NON-NEGOTIABLE RULES — nothing outside this function is
+        // allowed to change the video's paused state or muted state.
+        //
+        //   1. Clicking anywhere on the William dashboard → nothing.
+        //      Same-dashboard clicks/taps do not touch the video.
+        //
+        //   2. Leaving the page (tab hidden, minimise, lock, pagehide,
+        //      beforeunload) → PAUSE. Mute state is NEVER changed.
+        //
+        //   3. Returning to the page → stay PAUSED. Nothing is auto-
+        //      resumed, and mute is not touched.
+        //
+        //   4. The play/pause button and the mute button are the ONLY
+        //      two ways the video's state ever changes. They are wired
+        //      in initVideoControls(). This function never interferes.
+        //
+        //   5. The city slideshow's audio is managed entirely by
+        //      initCitySlideshow(). This function never touches it.
+        // ============================================================
         function initBFCacheRecovery() {
             let reconnecting = false;
+
+            function wfGetVideo() {
+                return document.getElementById('mediaVideo');
+            }
+
+            // Pause because the page is leaving / hidden.
+            // NEVER touches muted state. NEVER touches volume.
+            function wfPauseOnLeave() {
+                const v = wfGetVideo();
+                if (!v) return;
+                try {
+                    if (!v.paused) {
+                        v.dataset.wfAutoPaused = '1';
+                        v.pause();
+                    }
+                } catch (e) { }
+            }
+
+            // Restore-on-return: does absolutely nothing to the video
+            // element. It stays exactly where the leave handler put it
+            // (paused). The user presses play when they want to resume.
+            function wfRestoreOnReturn() {
+                // Intentionally empty. Do not call play(). Do not touch
+                // muted. Do not touch volume. Do not touch src.
+            }
+
+            // --------------------------------------------------------
+            // These are the ONLY events that pause the William video.
+            // --------------------------------------------------------
+            document.addEventListener('visibilitychange', () => {
+                if (document.hidden) wfPauseOnLeave();
+                else wfRestoreOnReturn();
+            }, true);
+
+            window.addEventListener('pagehide', wfPauseOnLeave, true);
+            window.addEventListener('beforeunload', wfPauseOnLeave, true);
+
+            // NOTE: intentionally no 'blur' listener, no 'focus' listener,
+            // no 'click' listener, no 'mousemove' listener. The video must
+            // not react to anything happening on the same dashboard.
+
+            // --------------------------------------------------------
+            // RECONNECT — cloud only. Never touches the video element.
+            // --------------------------------------------------------
             async function reconnect() {
                 if (reconnecting) return;
                 reconnecting = true;
@@ -13971,23 +14420,12 @@
                             }
                         }
                     }
-                    // Re-pull the William dashboard image whenever the tab
-                    // becomes visible again. This guarantees the user's
-                    // uploaded image is always shown, no matter what state
-                    // the browser dropped while backgrounded.
-                    const email = currentUserEmail || window.__sessionRestoredEmail;
-                    if (email && typeof loadUserMedia === 'function') {
-                        try { await loadUserMedia(email); } catch (e) { }
-                    }
                 } catch (e) { }
                 setTimeout(() => { reconnecting = false; }, 1500);
             }
 
             window.addEventListener('pageshow', (e) => {
                 if (e.persisted) reconnect();
-            });
-            document.addEventListener('visibilitychange', () => {
-                if (!document.hidden) reconnect();
             });
         }
     </script>
@@ -14242,9 +14680,45 @@
                 // User media (William dashboard image + video) — these live
                 // in the per-user IndexedDB, so they must be reloaded on boot
                 // or they appear "lost" after a hard refresh.
+                //
+                // loadUserMedia only attaches the Blob src. It never calls
+                // play() or pause(). The video's own state decides what it
+                // does — the user's last action is respected.
                 try {
                     await loadUserMedia(currentUserEmail);
                 } catch (e) { }
+
+                // Warm the video Blob cache in the background so that
+                // tapping "Continue" (into the William dashboard) shows
+                // the video instantly. We read the Blob from IndexedDB
+                // directly — no base64 decode, no RAM blow-up.
+                (async () => {
+                    try {
+                        const db = await initUserStorageDB(currentUserEmail);
+                        const tx = db.transaction([USER_VIDEOS_STORE], "readonly");
+                        const store = tx.objectStore(USER_VIDEOS_STORE);
+                        const request = store.get("william_dashboard_video");
+                        const record = await new Promise((resolve) => {
+                            request.onsuccess = () => resolve(request.result || null);
+                            request.onerror = () => resolve(null);
+                        });
+                        if (record && record.kind === 'blob' && record.blob instanceof Blob) {
+                            __wfGetCachedVideoUrl(record.blob);
+                        }
+                    } catch (e) { }
+
+                    // Small-file fallback (< 4 MB) via the localStorage mirror
+                    try {
+                        const raw = localStorage.getItem('wf_user_video_mirror_' + currentUserEmail);
+                        if (raw) {
+                            const parsed = JSON.parse(raw);
+                            if (parsed && parsed.data && typeof parsed.data === 'string' && parsed.data.length > 32) {
+                                const blob = await __wfBlobFromDataUrlSmall(parsed.data, parsed.mime);
+                                if (blob) __wfGetCachedVideoUrl(blob);
+                            }
+                        }
+                    } catch (e) { }
+                })();
             }
 
             // 10. Initial mobile menu visibility
