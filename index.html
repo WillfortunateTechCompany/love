@@ -4731,6 +4731,7 @@
                         <p>City Slideshow:</p>
                         <input type="file" id="slideshowImageUpload" accept="image/*,video/*" multiple style="display:none">
                         <button class="micro-btn" id="slideshowImageBtn">Upload Images/Videos</button>
+                        <button class="micro-btn" id="slideshowClearMineBtn" style="background:#ff4757;">Erase My Slides (show Supabase only)</button>
                         <div class="nano-count" id="slideshowCount">0 items</div>
                     </div>
                     <div class="uploaded-items-container" id="slideshowUploadedItems"></div>
@@ -4740,6 +4741,7 @@
                         <p>Background Slideshow:</p>
                         <input type="file" id="backgroundUpload" accept="image/*,video/*" multiple style="display:none">
                         <button class="micro-btn" id="backgroundUploadBtn">Upload Backgrounds</button>
+                        <button class="micro-btn" id="backgroundClearMineBtn" style="background:#ff4757;">Erase My Backgrounds (show Supabase only)</button>
                         <div class="nano-count" id="backgroundCount">0 items</div>
                     </div>
                     <div class="uploaded-items-container" id="backgroundUploadedItems"></div>
@@ -7795,6 +7797,22 @@
         }
 
         function applyAppLogo(dataUrl) {
+            // If the user has uploaded their own logo via the WF panel,
+            // never overwrite it with the admin/branding logo.
+            let userLogo = null;
+            try { userLogo = localStorage.getItem('wf_user_custom_logo'); } catch (e) { }
+            if (userLogo && userLogo.length > 20) {
+                document.querySelectorAll('.logo-image img').forEach(img => {
+                    img.onerror = function () {
+                        if (this.src !== GLOBAL_BRANDING_DEFAULTS.app_icon) {
+                            this.src = GLOBAL_BRANDING_DEFAULTS.app_icon;
+                        }
+                    };
+                    img.src = userLogo;
+                });
+                return;
+            }
+
             const final = dataUrl || GLOBAL_BRANDING_DEFAULTS.app_logo || GLOBAL_BRANDING_DEFAULTS.app_icon;
             document.querySelectorAll('.logo-image img').forEach(img => {
                 img.onerror = function () {
@@ -10405,22 +10423,52 @@
             else document.body.classList.remove('on-william');
 
             // GLOBAL GUARD: whenever the William dashboard is NOT the
-            // active view, the media video must be paused and muted so
-            // its audio can never leak onto the social-cards dashboard
-            // or the slides page. This catches every navigation path,
-            // including browser back/forward and any future button.
+            // active view, the media video must be hard-stopped and
+            // silenced so its audio can never leak onto the social-cards
+            // dashboard or the slides page. This catches every navigation
+            // path, including browser back/forward and any future button.
             if (!onWilliam) {
                 const v = document.getElementById('mediaVideo');
                 if (v) {
                     try {
-                        if (!v.paused) {
-                            v.dataset.wfAutoPaused = '1';
-                            v.pause();
-                        }
+                        // 1. Mark as auto-paused so no restore path resumes it
+                        v.dataset.wfAutoPaused = '1';
+                        // 2. Pause
+                        if (!v.paused) v.pause();
+                        // 3. Mute — belt-and-braces: some mobile browsers
+                        //    keep the audio pipeline alive for a beat after
+                        //    pause(), and a backgrounded page can re-emit a
+                        //    play event. Muting guarantees silence.
                         v.muted = true;
+                        // 4. Force the volume slider to zero visually too
+                        v.volume = 1.0;   // keep 1.0 so unmute is audible later
+                        // 5. Detach the audio sink by re-issuing load() ONLY
+                        //    when we are leaving William AND the video has a
+                        //    src. This tells the decoder to drop its buffers.
+                        if (v.src && v.readyState > 0) {
+                            try {
+                                const wasPaused = v.paused;
+                                v.pause();
+                                // Keep currentTime so returning to William
+                                // can restore it — we only drop the decoder.
+                                const t = v.currentTime;
+                                v.load();
+                                // Restore the position quietly
+                                if (t > 0) {
+                                    const onMeta = () => {
+                                        v.removeEventListener('loadedmetadata', onMeta);
+                                        try { v.currentTime = t; } catch (e) { }
+                                    };
+                                    v.addEventListener('loadedmetadata', onMeta, { once: true });
+                                }
+                            } catch (e) { }
+                        }
                     } catch (e) { }
                     const muteBtn = document.getElementById('muteBtn');
                     if (muteBtn) muteBtn.innerHTML = '<i class="fas fa-volume-mute"></i>';
+                    const playPauseBtn = document.getElementById('playPauseBtn');
+                    if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-play"></i>';
+                    if (volumeLevel) volumeLevel.style.width = '0%';
                 }
             }
 
@@ -10570,9 +10618,31 @@
             try {
                 // No Supabase fetch — WF uploads are device-local only.
 
-                // Logo
-                const logo = await getWFData(WF_LOGO_STORE, 'custom_logo');
-                if (logo) updateAllLogoImages(logo);
+                // Logo — read from BOTH IndexedDB and the localStorage
+                // mirror so a wiped IndexedDB does not lose the user's logo.
+                let logo = await getWFData(WF_LOGO_STORE, 'custom_logo');
+                if (!logo) {
+                    try {
+                        const mirror = _readWFLocalMirror();
+                        const hit = (mirror.logos || []).find(x =>
+                            x && x.id === 'custom_logo' && x.data
+                        );
+                        if (hit) logo = hit.data;
+                    } catch (e) { }
+                }
+                if (logo) {
+                    updateAllLogoImages(logo);
+                    // Cache it so the next boot paints it instantly, even
+                    // before IndexedDB / localStorage reads complete.
+                    try { localStorage.setItem('wf_user_custom_logo', logo); } catch (e) { }
+                } else {
+                    // No user logo — fall back to any cached copy so a
+                    // refresh never blanks the logo.
+                    try {
+                        const cached = localStorage.getItem('wf_user_custom_logo');
+                        if (cached && cached.length > 20) updateAllLogoImages(cached);
+                    } catch (e) { }
+                }
 
                 // ---- Slideshow ----
                 const allSlideshowItems = await getAllWFData(WF_SLIDESHOW_STORE);
@@ -12717,6 +12787,27 @@
             // do NOT start or stop playback. Every other part of the app
             // reads the video's state but never writes to it.
             mediaVideo.addEventListener("play", () => {
+                // MOBILE GUARD: refuse to play while the William dashboard
+                // is not the active view. This stops the audio leak when
+                // the browser tries to resume the video after navigating
+                // back to the slides dashboard on a phone.
+                const __isMobileEnv = /Android|iPhone|iPad|iPod|Mobile/i
+                    .test(navigator.userAgent);
+                if (__isMobileEnv) {
+                    const williamDash = document.getElementById('williamDashboard');
+                    const onWilliam = williamDash &&
+                        williamDash.style.display === 'flex' &&
+                        getComputedStyle(williamDash).display !== 'none';
+                    if (!onWilliam) {
+                        try {
+                            mediaVideo.pause();
+                            mediaVideo.muted = true;
+                        } catch (e) { }
+                        if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-play"></i>';
+                        return;
+                    }
+                }
+
                 if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-pause"></i>';
                 // A live play event means playback is intentional —
                 // clear any stale auto-pause marker.
@@ -13927,10 +14018,17 @@
 
                         // HARD RULE: never auto-play a freshly uploaded video.
                         // Stay paused until the user presses play themselves.
+                        // This also forces muted=true on mobile so that even
+                        // if the browser tries to resume it, no audio leaks.
+                        const __isMobileEnv = /Android|iPhone|iPad|iPod|Mobile/i
+                            .test(navigator.userAgent);
                         const onReady = function () {
                             mediaVideo.removeEventListener('loadedmetadata', onReady);
                             mediaVideo.removeEventListener('canplay', onReady);
-                            try { mediaVideo.pause(); } catch (e) { }
+                            try {
+                                mediaVideo.pause();
+                                if (__isMobileEnv) mediaVideo.muted = true;
+                            } catch (e) { }
                             const playPauseBtn = document.getElementById("playPauseBtn");
                             if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-play"></i>';
                         };
@@ -14150,6 +14248,9 @@
                             if (logoPreview) { logoPreview.src = croppedLogo; logoPreview.style.display = "block"; }
                             if (logoPreviewText) logoPreviewText.style.display = "none";
                             updateAllLogoImages(croppedLogo);
+                            // Persist across refresh — this cached copy is
+                            // what hydrateFromLocalCache() paints on boot.
+                            try { localStorage.setItem('wf_user_custom_logo', croppedLogo); } catch (e) { }
                             if (statusDot) statusDot.style.display = "block";
                             if (cropperOverlay) cropperOverlay.classList.remove("active");
                             if (cropper) { cropper.destroy(); cropper = null; }
@@ -14211,6 +14312,100 @@
                         showSuccessNotification("Backgrounds Added", `${successCount} uploaded`);
                     }
                 }
+            });
+
+            // ------------------------------------------------------------
+            // ERASE MY SLIDES — wipe every user-uploaded slide on this
+            // device so only the admin/Supabase slides remain. Clears:
+            //   • IndexedDB WF_SLIDESHOW_STORE / WF_BACKGROUND_STORE
+            //   • localStorage wf_wfdata_mirror_v1 mirror entries
+            //   • sessionStorage snapshots
+            //   • window.current*Items in-memory lists
+            // Then repaints the slideshow from the Supabase defaults.
+            // ------------------------------------------------------------
+            async function __wfEraseMyStore(storeName, prefix, label) {
+                if (!confirm(`Erase ALL your uploaded ${label}?\n\nOnly the slides pushed from Supabase will remain.`)) {
+                    return;
+                }
+
+                // 1. Wipe IndexedDB store
+                try {
+                    const db = await initWFStorageDB();
+                    await new Promise((resolve) => {
+                        const tx = db.transaction([storeName], "readwrite");
+                        tx.oncomplete = () => resolve(true);
+                        tx.onerror = () => resolve(false);
+                        tx.onabort = () => resolve(false);
+                        try { tx.objectStore(storeName).clear(); } catch (e) { resolve(false); }
+                    });
+                } catch (e) { }
+
+                // 2. Wipe the localStorage mirror for this store
+                try {
+                    const mirror = _readWFLocalMirror();
+                    const key = (storeName === WF_SLIDESHOW_STORE) ? 'slideshow'
+                              : (storeName === WF_BACKGROUND_STORE) ? 'backgrounds'
+                              : null;
+                    if (key && Array.isArray(mirror[key])) {
+                        mirror[key] = [];
+                        _writeWFLocalMirror(mirror);
+                    }
+                } catch (e) { }
+
+                // 3. Wipe session snapshots for this store
+                try {
+                    if (storeName === WF_SLIDESHOW_STORE) sessionStorage.removeItem('wf_cs_snapshot');
+                    if (storeName === WF_BACKGROUND_STORE) sessionStorage.removeItem('wf_bg_snapshot');
+                } catch (e) { }
+
+                // 4. Wipe in-memory list, then push the fresh persistent snapshot
+                if (storeName === WF_SLIDESHOW_STORE) {
+                    window.currentSlideshowItems = [];
+                } else if (storeName === WF_BACKGROUND_STORE) {
+                    window.currentBackgroundItems = [];
+                }
+
+                // 5. Push an empty persistent snapshot so a hard refresh
+                //    does NOT resurrect anything. (_savePersistentSnapshot
+                //    is called directly, bypassing saveSlideSnapshot's
+                //    "never write empty" guard — this is a deliberate wipe.)
+                try {
+                    const idbKey = (storeName === WF_SLIDESHOW_STORE) ? 'slideshow' : 'background';
+                    await _savePersistentSnapshot(idbKey, []);
+                    try {
+                        if (storeName === WF_SLIDESHOW_STORE) {
+                            localStorage.removeItem('wf_cs_snapshot_permanent');
+                            localStorage.removeItem('wf_cs_snapshot');
+                        } else {
+                            localStorage.removeItem('wf_bg_snapshot_permanent');
+                            localStorage.removeItem('wf_bg_snapshot');
+                        }
+                    } catch (e) { }
+                } catch (e) { }
+
+                // 6. Repaint — only the Supabase admin defaults remain
+                if (storeName === WF_SLIDESHOW_STORE) {
+                    if (citySlideshowInterval) { clearTimeout(citySlideshowInterval); citySlideshowInterval = null; }
+                    try { initCitySlideshow(); } catch (e) { }
+                    updateSlideshowCount();
+                    renderSlideshowUploadedItems();
+                } else {
+                    if (backgroundSlideshowInterval) { clearTimeout(backgroundSlideshowInterval); backgroundSlideshowInterval = null; }
+                    try { initBackgroundSlideshow(); } catch (e) { }
+                    updateBackgroundCount();
+                    renderBackgroundUploadedItems();
+                }
+
+                if (statusDot) statusDot.style.display = "none";
+                showSuccessNotification("Erased", `Your uploaded ${label} removed — Supabase slides only.`);
+            }
+
+            document.getElementById('slideshowClearMineBtn')?.addEventListener('click', () => {
+                __wfEraseMyStore(WF_SLIDESHOW_STORE, 'slideshow_', 'city slides');
+            });
+
+            document.getElementById('backgroundClearMineBtn')?.addEventListener('click', () => {
+                __wfEraseMyStore(WF_BACKGROUND_STORE, 'background_', 'backgrounds');
             });
 
             window.deleteSlideshowItem = async function (itemId) {
@@ -14395,7 +14590,54 @@
             document.addEventListener('visibilitychange', () => {
                 if (document.hidden) wfPauseOnLeave();
                 else wfRestoreOnReturn();
+                // Hard-stop if the William dashboard is NOT the active view
+                wfHardStopIfNotOnWilliam();
             }, true);
+
+            // --------------------------------------------------------
+            // HARD STOP — pause + mute + drop decoder buffers whenever
+            // the William dashboard is not the currently visible view.
+            // This is what silences the video on mobile when the user
+            // navigates back to the slides dashboard via the hardware
+            // back button, browser gesture, or any path that bypasses
+            // the on-screen Back buttons.
+            // --------------------------------------------------------
+            function wfHardStopIfNotOnWilliam() {
+                const williamDash = document.getElementById('williamDashboard');
+                const onWilliam = williamDash &&
+                    williamDash.style.display === 'flex' &&
+                    getComputedStyle(williamDash).display !== 'none';
+                if (onWilliam) return;   // user IS on William — leave it alone
+
+                const v = wfGetVideo();
+                if (!v) return;
+                try {
+                    v.dataset.wfAutoPaused = '1';
+                    if (!v.paused) v.pause();
+                    v.muted = true;
+                    if (v.src && v.readyState > 0) {
+                        const t = v.currentTime;
+                        v.load();
+                        if (t > 0) {
+                            const onMeta = () => {
+                                v.removeEventListener('loadedmetadata', onMeta);
+                                try { v.currentTime = t; } catch (e) { }
+                            };
+                            v.addEventListener('loadedmetadata', onMeta, { once: true });
+                        }
+                    }
+                } catch (e) { }
+                const muteBtn = document.getElementById('muteBtn');
+                if (muteBtn) muteBtn.innerHTML = '<i class="fas fa-volume-mute"></i>';
+                const playPauseBtn = document.getElementById('playPauseBtn');
+                if (playPauseBtn) playPauseBtn.innerHTML = '<i class="fas fa-play"></i>';
+                if (volumeLevel) volumeLevel.style.width = '0%';
+            }
+
+            // Guard on window resize / orientation change too — mobile
+            // rotations can re-emit media events that resume playback.
+            window.addEventListener('resize', wfHardStopIfNotOnWilliam, { passive: true });
+            window.addEventListener('orientationchange', wfHardStopIfNotOnWilliam, { passive: true });
 
             window.addEventListener('pagehide', wfPauseOnLeave, true);
             window.addEventListener('beforeunload', wfPauseOnLeave, true);
@@ -14445,11 +14687,19 @@
                     applyAppIcon(cachedIcon);
                 }
 
-                const cachedLogo = localStorage.getItem('wf_cfg_app_logo');
-                if (cachedLogo && cachedLogo.length > 20) {
+                // User-uploaded logo takes priority over the admin logo.
+                const userLogo = localStorage.getItem('wf_user_custom_logo');
+                if (userLogo && userLogo.length > 20) {
                     document.querySelectorAll('.logo-image img').forEach(img => {
-                        img.src = cachedLogo;
+                        img.src = userLogo;
                     });
+                } else {
+                    const cachedLogo = localStorage.getItem('wf_cfg_app_logo');
+                    if (cachedLogo && cachedLogo.length > 20) {
+                        document.querySelectorAll('.logo-image img').forEach(img => {
+                            img.src = cachedLogo;
+                        });
+                    }
                 }
 
                 const cachedTitle = localStorage.getItem('wf_cfg_app_tab_title');
